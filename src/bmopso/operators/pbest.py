@@ -5,8 +5,6 @@ from __future__ import annotations
 from typing import Tuple
 import numpy as np
 
-from bmopso.util.dominance import dominates
-
 __all__ = ["update_personal_bests"]
 
 
@@ -17,6 +15,7 @@ def update_personal_bests(
     x: np.ndarray,
     f: np.ndarray,
     cv: np.ndarray,
+    random_state: np.random.Generator | None = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Update personal best positions using Constrained-Dominance and Coello Coello (2004) rules.
 
@@ -40,12 +39,15 @@ def update_personal_bests(
         New objective values (n_particles, n_obj).
     cv : np.ndarray
         New constraint violations (n_particles,).
+    random_state : np.random.Generator | None, default=None
+        NumPy Generator used for the incomparable coin-flip. If None, uses an isolated Generator.
 
     Returns
     -------
     Tuple[np.ndarray, np.ndarray, np.ndarray]
         Updated (pbest_x, pbest_f, pbest_cv).
     """
+    rng = random_state if random_state is not None else np.random.default_rng()
     n_particles = len(x)
     new_pbest_x = pbest_x.copy()
     new_pbest_f = pbest_f.copy()
@@ -53,21 +55,33 @@ def update_personal_bests(
         pbest_cv.copy() if pbest_cv is not None else np.zeros(n_particles, dtype=float)
     )
 
-    for i in range(n_particles):
-        f_new = f[i]
-        f_old = new_pbest_f[i]
-        cv_new = float(cv[i])
-        cv_old = float(new_pbest_cv[i])
+    cv_new = np.asarray(cv, dtype=float).reshape(-1)
+    cv_old = np.asarray(new_pbest_cv, dtype=float).reshape(-1)
 
-        if dominates(f_new, f_old, cv_new, cv_old):
-            new_pbest_x[i] = x[i].copy()
-            new_pbest_f[i] = f_new.copy()
-            new_pbest_cv[i] = cv_new
-        elif not dominates(f_old, f_new, cv_old, cv_new):
-            # Incomparable: randomly choose between current position and pbest (Coello Coello et al., 2004)
-            if np.random.rand() < 0.5:
-                new_pbest_x[i] = x[i].copy()
-                new_pbest_f[i] = f_new.copy()
-                new_pbest_cv[i] = cv_new
+    new_viol = cv_new > 0.0
+    old_viol = cv_old > 0.0
+    both_infeasible = new_viol & old_viol
+    both_feasible = ~new_viol & ~old_viol
+
+    new_pareto_old = np.all(f <= new_pbest_f, axis=1) & np.any(f < new_pbest_f, axis=1)
+    old_pareto_new = np.all(new_pbest_f <= f, axis=1) & np.any(new_pbest_f < f, axis=1)
+
+    new_dom_old = (
+        (~new_viol & old_viol)
+        | (both_infeasible & (cv_new < cv_old))
+        | (both_feasible & new_pareto_old)
+    )
+    old_dom_new = (
+        (~old_viol & new_viol)
+        | (both_infeasible & (cv_old < cv_new))
+        | (both_feasible & old_pareto_new)
+    )
+
+    incomparable = ~new_dom_old & ~old_dom_new
+    replace = new_dom_old | (incomparable & (rng.random(n_particles) < 0.5))
+
+    new_pbest_x[replace] = x[replace]
+    new_pbest_f[replace] = f[replace]
+    new_pbest_cv[replace] = cv_new[replace]
 
     return new_pbest_x, new_pbest_f, new_pbest_cv

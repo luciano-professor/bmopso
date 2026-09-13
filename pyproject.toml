@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bmopso"
-version = "1.0.1"
+version = "1.0.2"
 
 description = "Binary Multiobjective Particle Swarm Optimization (BMOPSO) for pymoo"
 readme = "README.md"

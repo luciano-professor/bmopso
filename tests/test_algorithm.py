@@ -215,3 +215,21 @@ def test_constrained_dominance_deb_rules() -> None:
     cv_matrix = np.array([0.0, 0.0, 10.0])  # Point 2 has best F, but is infeasible
     non_dom_idx = find_non_dominated_constrained(f_matrix, cv_matrix)
     assert set(non_dom_idx.tolist()) == {0, 1}
+
+
+def test_bmopso_same_seed_is_reproducible() -> None:
+    """The same pymoo seed must reproduce X, F, and velocities across independent runs."""
+    problem = SimpleBinaryProblem(n_var=12)
+
+    def run(seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        algo = BMOPSO(n_particles=16, w=0.5, c1=1.5, c2=1.5, n_grid=10)
+        res = minimize(problem, algo, termination=("n_gen", 6), seed=seed, verbose=False)
+        evolved = res.algorithm
+        assert res.X is not None and res.F is not None and evolved.V is not None
+        return res.X.copy(), res.F.copy(), evolved.V.copy()
+
+    x1, f1, v1 = run(42)
+    x2, f2, v2 = run(42)
+    assert np.array_equal(x1, x2)
+    assert np.allclose(f1, f2)
+    assert np.allclose(v1, v2)

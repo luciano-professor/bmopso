@@ -9,7 +9,7 @@ DOI: https://doi.org/10.1109/TEVC.2004.826067
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Tuple
 import numpy as np
 
 __all__ = ["AdaptiveGrid"]
@@ -104,11 +104,86 @@ class AdaptiveGrid:
         _, inverse_indices = np.unique(coords, axis=0, return_inverse=True)
         return inverse_indices
 
+    def _hypercube_membership(
+        self, f: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Map solutions to hypercube IDs, occupancy, grouped indices, and group starts.
+
+        Returns
+        -------
+        hypercube_ids : np.ndarray
+            Integer IDs of shape (N,) in ``[0, K)``.
+        counts : np.ndarray
+            Occupancy of each occupied hypercube, shape (K,).
+        order : np.ndarray
+            Stable argsort of ``hypercube_ids`` so members of cube ``k`` occupy
+            ``order[starts[k] : starts[k] + counts[k]]``.
+        starts : np.ndarray
+            Start offset of each cube inside ``order``, shape (K,).
+        """
+        hypercube_ids = self.get_hypercube_ids(f)
+        counts = np.bincount(hypercube_ids)
+        order = np.argsort(hypercube_ids, kind="stable")
+        starts = np.zeros(len(counts), dtype=int)
+        if len(counts) > 1:
+            starts[1:] = np.cumsum(counts[:-1])
+        return hypercube_ids, counts, order, starts
+
+    def _crowded_removal_counts(
+        self,
+        counts: np.ndarray,
+        num_to_remove: int,
+        random_state: np.random.Generator | None = None,
+    ) -> np.ndarray:
+        """Compute per-hypercube removals equivalent to sequential crowded pruning.
+
+        Each step of Coello Coello et al. (2004) deletes one solution from a
+        currently most-populated hypercube. Water-filling batches every layer of
+        tied maxima: if ``k`` cubes share occupancy ``M`` and the next density is
+        ``M2``, the next ``k * (M - M2)`` deletions stay inside that tied set.
+        """
+        rng = random_state if random_state is not None else np.random.default_rng()
+        live = counts.astype(int, copy=True)
+        remove_counts = np.zeros_like(live)
+        remaining = int(num_to_remove)
+
+        while remaining > 0:
+            max_pop = int(live.max())
+            at_max = live == max_pop
+            n_max = int(np.count_nonzero(at_max))
+            if n_max == 0 or max_pop <= 0:
+                break
+
+            if np.any(~at_max):
+                second = int(live[~at_max].max())
+            else:
+                second = 0
+
+            layer = max_pop - second
+            if layer <= 0:
+                break
+
+            batch = min(remaining, n_max * layer)
+            per_cube, extra = divmod(batch, n_max)
+            delta = np.zeros_like(live)
+            delta[at_max] = per_cube
+            if extra > 0:
+                chosen = rng.choice(
+                    np.flatnonzero(at_max), size=extra, replace=False
+                )
+                delta[chosen] += 1
+            live -= delta
+            remove_counts += delta
+            remaining -= batch
+
+        return remove_counts
+
     def select_leaders(
         self,
         x: np.ndarray,
         f: np.ndarray,
         n_particles: int,
+        random_state: np.random.Generator | None = None,
     ) -> np.ndarray:
         """Select social leaders (gbest) for swarm particles using Coello Coello (2004) Grid Roulette.
 
@@ -120,6 +195,9 @@ class AdaptiveGrid:
             Objective matrix in the archive of shape (N, n_obj).
         n_particles : int
             Number of particles requiring a leader.
+        random_state : np.random.Generator | None, default=None
+            NumPy Generator used for roulette and within-cube sampling.
+            If None, uses an isolated Generator.
 
         Returns
         -------
@@ -132,33 +210,21 @@ class AdaptiveGrid:
         if n_solutions == 1:
             return np.tile(x[0], (n_particles, 1))
 
-        hypercube_ids = self.get_hypercube_ids(f)
+        rng = random_state if random_state is not None else np.random.default_rng()
+        _, counts, order, starts = self._hypercube_membership(f)
 
-        # Group solution indices by hypercube ID
-        cubes: Dict[int, List[int]] = {}
-        for idx, cube_id in enumerate(hypercube_ids):
-            cubes.setdefault(int(cube_id), []).append(idx)
-
-        unique_cubes = list(cubes.keys())
         # Fitness is inversely proportional to hypercube population: fitness_i = 10.0 / N_i
-        fitnesses = np.array([10.0 / len(cubes[cid]) for cid in unique_cubes], dtype=float)
+        fitnesses = 10.0 / counts.astype(float)
         total_fitness = float(np.sum(fitnesses))
 
         if total_fitness > 0.0:
             probs = fitnesses / total_fitness
         else:
-            probs = np.full(len(unique_cubes), 1.0 / len(unique_cubes))
+            probs = np.full(len(counts), 1.0 / len(counts))
 
-        # Select hypercubes via Roulette Wheel Selection
-        selected_cube_indices = np.random.choice(len(unique_cubes), size=n_particles, p=probs)
-
-        # For each selected hypercube, choose one solution randomly (uniform random)
-        selected_leader_indices = np.zeros(n_particles, dtype=int)
-        for i, cube_idx in enumerate(selected_cube_indices):
-            cid = unique_cubes[cube_idx]
-            members = cubes[cid]
-            selected_leader_indices[i] = np.random.choice(members)
-
+        selected_cubes = rng.choice(len(counts), size=n_particles, p=probs)
+        offsets = (rng.random(n_particles) * counts[selected_cubes]).astype(int)
+        selected_leader_indices = order[starts[selected_cubes] + offsets]
         return x[selected_leader_indices]
 
     def prune_archive(
@@ -167,13 +233,15 @@ class AdaptiveGrid:
         f: np.ndarray,
         cv: np.ndarray,
         max_size: int,
+        random_state: np.random.Generator | None = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Prune archive solutions when exceeding max capacity by targeting the most crowded hypercubes.
 
         Following Coello Coello et al. (2004):
         Identifies hypercubes with the highest density (most solutions) and eliminates
-        a randomly selected solution from one of the most crowded hypercubes until the
-        archive reaches max_size.
+        solutions from the most crowded hypercubes until the archive reaches max_size.
+        Removals are batched by density layer (water-filling) and are equivalent to
+        deleting one random member of a current maximum-occupancy cube at a time.
 
         Parameters
         ----------
@@ -185,6 +253,9 @@ class AdaptiveGrid:
             Constraint violation array (N,).
         max_size : int
             Maximum allowable archive capacity.
+        random_state : np.random.Generator | None, default=None
+            NumPy Generator used for crowded-cube tie-breaks and victim sampling.
+            If None, uses an isolated Generator.
 
         Returns
         -------
@@ -195,30 +266,20 @@ class AdaptiveGrid:
         if num_to_remove <= 0:
             return x, f, cv
 
-        # 1. Compute grid and hypercube grouping once
-        hypercube_ids = self.get_hypercube_ids(f)
-        cubes: Dict[int, List[int]] = {}
-        for idx, cube_id in enumerate(hypercube_ids):
-            cubes.setdefault(int(cube_id), []).append(idx)
+        rng = random_state if random_state is not None else np.random.default_rng()
+        hypercube_ids, counts, _, _ = self._hypercube_membership(f)
+        remove_counts = self._crowded_removal_counts(
+            counts, num_to_remove, random_state=rng
+        )
 
-        victims: List[int] = []
+        rand_keys = rng.random(len(x))
+        prio = np.lexsort((rand_keys, hypercube_ids))
+        starts = np.zeros(len(counts), dtype=int)
+        if len(counts) > 1:
+            starts[1:] = np.cumsum(counts[:-1])
+        within_rank = np.arange(len(x)) - np.repeat(starts, counts)
+        victims = prio[within_rank < remove_counts[hypercube_ids[prio]]]
 
-        # 2. Select solutions to eliminate by updating in-memory hypercube memberships
-        for _ in range(num_to_remove):
-            max_pop = max(len(members) for members in cubes.values() if len(members) > 0)
-            most_crowded_cids = [
-                cid for cid, members in cubes.items() if len(members) == max_pop
-            ]
-
-            chosen_cid = most_crowded_cids[np.random.randint(0, len(most_crowded_cids))]
-            victim_idx = int(np.random.choice(cubes[chosen_cid]))
-
-            # Remove from hypercube virtual membership and mark for deletion
-            cubes[chosen_cid].remove(victim_idx)
-            victims.append(victim_idx)
-
-        # 3. Delete all victims in a single pass using boolean masking
         mask = np.ones(len(x), dtype=bool)
         mask[victims] = False
-
         return x[mask], f[mask], cv[mask]

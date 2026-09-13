@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.0.2] - 2026-09-13
+
+### Changed
+- All algorithm draws now use pymoo's `self.random_state` (`np.random.Generator`) so `minimize(..., seed=s)` is reproducible.
+- Vectorized personal-best updates, hypercube grouping, leader roulette, and crowded-archive pruning without changing Coello/Deb decision rules.
+
+### Added
+- Pytest coverage that two independent `minimize(..., seed=42)` runs match `X`, `F`, and `V`.
+
+---
+
 ## [1.0.1] - 2026-09-11
 
 ### Changed
